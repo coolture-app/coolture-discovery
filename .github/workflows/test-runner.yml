@@ -1,0 +1,26 @@
+name: Test Self-Hosted Runner
+
+on:
+  push:
+    branches:
+      - '*'
+
+jobs:
+  test_runner:
+    runs-on: [self-hosted, linux]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Print runner info
+        run: |
+          echo "Runner hostname: $(hostname)"
+          echo "Runner user: $(whoami)"
+          echo "Current directory: $(pwd)"
+          echo "Docker version:"
+          docker --version
+
+      - name: Simple test command
+        run: |
+          echo "Hello from self-hosted runner!"
