@@ -1,0 +1,8 @@
+numpy
+psycopg2-binary
+sentence-transformers
+transformers
+torch
+huggingface-hub
+scikit-learn
+reportlab
