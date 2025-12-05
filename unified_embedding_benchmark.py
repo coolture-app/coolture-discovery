@@ -4,6 +4,7 @@ import numpy as np
 import psycopg2
 from psycopg2.extras import execute_values
 from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # --- CONFIGURATION ---
 DB_NAME = "vectordb"
@@ -176,6 +177,26 @@ except Exception:
     print("Warning: Arial font not found. Polish characters might not render correctly.")
     FONT_NAME = 'Helvetica' # Fallback
 
+def get_color_for_value(val):
+    """
+    Returns a ReportLab Color object based on the value (0.0 to 1.0).
+    Interpolates between White (0.0) and Dark Blue (1.0).
+    """
+    # White: (1, 1, 1)
+    # Dark Blue: (0, 0, 0.5) roughly
+    # Let's do White -> Blue
+    # R: 1 -> 0
+    # G: 1 -> 0
+    # B: 1 -> 1 (or stay high)
+    
+    # Simple heatmap: White -> Red (low sim) is bad? No, usually Blue is good.
+    # Let's do White -> Blue
+    
+    # 0.0 -> White (1, 1, 1)
+    # 1.0 -> Blue (0, 0, 1)
+    
+    return colors.Color(1 - val, 1 - val, 1)
+
 # --- FORMATTING HELPERS ---
 def print_side_by_side_table(query_title, query_content, model_results):
     # model_results: dict {model_name: [(title, sim), ...]}
@@ -214,7 +235,9 @@ def print_side_by_side_table(query_title, query_content, model_results):
         print("".join(str(val).ljust(w) for val, w in zip(row, col_widths)))
     print("-" * len(header_str))
 
-def generate_pdf(filename, all_events, all_query_results, metric_results):
+    print("-" * len(header_str))
+
+def generate_pdf(filename, all_events, all_query_results, metric_results, similarity_matrices):
     doc = SimpleDocTemplate(filename, pagesize=landscape(letter), topMargin=30, bottomMargin=30, leftMargin=30, rightMargin=30)
     elements = []
     styles = getSampleStyleSheet()
@@ -338,6 +361,69 @@ def generate_pdf(filename, all_events, all_query_results, metric_results):
         ]))
         elements.append(t)
 
+    # 3. Confusion Matrices (Similarity Heatmaps)
+    if similarity_matrices:
+        elements.append(PageBreak())
+        elements.append(Paragraph("Confusion Matrices (Cross-Similarity)", h1_style))
+        elements.append(Paragraph("Heatmap of cosine similarity between all events. Axes are Event IDs.", normal_style))
+        elements.append(Spacer(1, 10))
+
+        for model_name, matrix_data in similarity_matrices.items():
+            # matrix_data: {'ids': [id1, id2...], 'matrix': [[val, ...], ...]}
+            ids = matrix_data['ids']
+            matrix = matrix_data['matrix']
+            
+            elements.append(Paragraph(f"<b>Model:</b> {model_name}", h2_style))
+            elements.append(Spacer(1, 5))
+            
+            # Prepare Table Data
+            # Header Row: Empty + IDs
+            header_row = [Paragraph("", table_cell_style)] + [Paragraph(f"<b>{id_}</b>", table_cell_style) for id_ in ids]
+            data = [header_row]
+            
+            # Data Rows
+            for i, row_vals in enumerate(matrix):
+                row_id = ids[i]
+                # First col is ID
+                table_row = [Paragraph(f"<b>{row_id}</b>", table_cell_style)]
+                for val in row_vals:
+                    # val is float 0-1
+                    bg_color = get_color_for_value(val)
+                    # Text color: white if dark bg, black if light bg
+                    text_color = "white" if val > 0.5 else "black"
+                    cell_text = f"<font color='{text_color}'>{val:.2f}</font>"
+                    table_row.append(Paragraph(cell_text, table_cell_style))
+                data.append(table_row)
+            
+            # Create Table
+            # Widths: Auto or fixed?
+            # Let's try to fit in page.
+            avail_width = landscape(letter)[0] - 60
+            col_width = avail_width / (len(ids) + 1)
+            
+            t = Table(data, colWidths=[col_width] * (len(ids) + 1))
+            
+            # Styles
+            style_cmds = [
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('FONTSIZE', (0, 0), (-1, -1), 6), # Smaller font for matrix
+            ]
+            
+            # Color cells
+            for r_idx, row_vals in enumerate(matrix):
+                for c_idx, val in enumerate(row_vals):
+                    # r_idx corresponds to data row r_idx + 1
+                    # c_idx corresponds to col c_idx + 1
+                    bg_color = get_color_for_value(val)
+                    style_cmds.append(('BACKGROUND', (c_idx + 1, r_idx + 1), (c_idx + 1, r_idx + 1), bg_color))
+            
+            t.setStyle(TableStyle(style_cmds))
+            elements.append(t)
+            elements.append(Spacer(1, 20))
+            elements.append(PageBreak())
+
     doc.build(elements)
     print(f"\nPDF generated: {filename}")
 
@@ -410,6 +496,42 @@ def main():
     print("="*50)
 
     cur = conn.cursor()
+    
+    # Calculate Similarity Matrices
+    similarity_matrices = {} # {model_name: {'ids': [], 'matrix': []}}
+    
+    for model_cfg in MODELS:
+        # Fetch all embeddings for this model
+        cur.execute(f"SELECT id, embedding FROM {model_cfg['table']} ORDER BY id ASC")
+        rows = cur.fetchall()
+        if not rows:
+            continue
+            
+        ids = [r[0] for r in rows]
+        # Parse vector string "[1,2,3]" -> np array
+        embeddings = []
+        for r in rows:
+            # embedding is returned as string by psycopg2 vector extension usually, or list if casted?
+            # It seems execute_values inserts lists, but fetchall returns strings like '[...]' or numpy arrays if adapter registered?
+            # Let's check type or just parse safely.
+            emb_val = r[1]
+            if isinstance(emb_val, str):
+                emb_val = np.array(eval(emb_val)) # eval is safe enough here for local vector string
+            else:
+                emb_val = np.array(emb_val)
+            embeddings.append(emb_val)
+            
+        embeddings = np.array(embeddings)
+        
+        # Calculate Cosine Similarity
+        # embeddings shape: (N, dim)
+        sim_matrix = cosine_similarity(embeddings)
+        
+        similarity_matrices[model_cfg['name']] = {
+            'ids': ids,
+            'matrix': sim_matrix
+        }
+
     all_query_results = [] # Store for PDF
     
     # Fetch all events for the first page (using first model's table)
@@ -511,7 +633,7 @@ def main():
     conn.close()
     
     # Generate PDF
-    generate_pdf("benchmark_results.pdf", all_events, all_query_results, metric_results)
+    generate_pdf("benchmark_results.pdf", all_events, all_query_results, metric_results, similarity_matrices)
     print("\nDone.")
 
 if __name__ == "__main__":
